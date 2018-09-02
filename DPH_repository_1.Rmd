@@ -1,0 +1,259 @@
+---
+title: "Automating analysis of DPH annual reports"
+output: 
+  
+  html_document: 
+    number_sections: yes
+    toc: yes
+    toc_float: yes
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+
+## Global options
+knitr::opts_chunk$set(echo=TRUE,
+               cache=TRUE, 
+               warning = FALSE, message = FALSE)
+library(pacman)
+#devtools::install_github("julianflowers/myScrapers")
+p_load(knitr, myScrapers, tidyverse, readtext, kableExtra, quanteda, tidytext, magrittr, text2vec, irlba, rvest, data.table, downloader)
+
+#source("../R/googlesearchR.R")
+
+
+```
+
+# Introduction
+
+This note describes automating the discovery, collation and analysis of annual reports of the Director of Public Health (DPH reports). DPH reports are a statutory requirement for DsPH in local authorities.^[The annual report is the DPH’s professional statement about the health of local communities, based on sound epidemiological evidence, and interpreted objectively. The report should be useful for both professionals and the public.
+However it is not just the annual review of public health outcomes and activity. The annual report is an important vehicle by which DsPH can identify key issues, flag up problems, report progress and thereby
+serve their local populations. It will also be a key resource to inform stakeholders of priorities and recommend actions to improve and protect the health of the communities they serve.
+It will be a tool for advocacy as well as a statement of needs, current priorities and action and continuing
+progress. It can also be a valuable process for internal reflection and team prioritisation as well as external
+engagement and awareness raising. http://www.adph.org.uk/wp-content/uploads/2013/08/DPH-Annual-Report-guidelines.pdf]
+
+It is motivated by:
+
+1. The apparent lack of any central repository for DsPH reports
+2. The desire to measure impact of PHE products
+3. The need to base product development on user need
+4. The availability of tools and techniques for automation and analysis
+
+Our hypothesis is that DsPH reports should be an important destination for Health Intelligence products for PHE, and that priorities and themes identified through annual reports should influence and be influenced by PHE and the Health Improvement Directorate
+
+## Methods
+
+We have used two data science techniques - web-scraping and text analysis (natural langauge processing or NLP) - to try and create a repository of DPH annual reports which we can then analyse. 
+
+There are 4 steps
+
+1. **Discovery** - We need to be able to find DPH reports on the web.  
+2. **Web-sraping** - if we can find reports or pages holding reports we can extract PDFs for further processing.   
+3. **Cleaning and processing** - creating a 'tidy' data frame of reports, cleaning texts, adding metadata e.g. report year, local authority name  
+4. **Analysis** - applying text mining and natural language processing tools to identify key themes, search for Health Intelligence products and so on.  
+
+To make this as automated as possible, all elements of the analytical pipeline have been conducted in R, and we have written functions and scripts to facilitate the process.
+
+### What is web-scraping
+
+Web-scraping is a technique for extracting information from websites. For example there is list of current Directors of Public Health on .GOV.UK at https://www.gov.uk/government/publications/directors-of-public-health-in-england--2/directors-of-public-health-in-england.
+
+This list can be automatically extracted and converted to a table:
+
+```{r, warning=FALSE}
+
+dsph <- myScrapers::get_dsph_england()
+
+dsph %>% write_csv("data/dsph.csv")
+
+head(dsph, 20) %>%
+  knitr::kable("html", caption = "DsPH in England") %>%
+  kableExtra::kable_styling(full_width = T )
+
+```
+
+# Discovery
+
+The usual approach to discovering reports would be to search Google. We have written a `googlesearchR` function which takes a search term and returns a list of links as below. We can use this to search Google for DPH reports and return the Urls directly to R. At the moment it only returns the first 100 hits.
+
+We will create a search string for each LA and then apply `googlesearchR` to try and identify the DPH annual reports
+
+```{r googlesearch}
+
+dsph <- myScrapers::get_dsph_england() %>% mutate(LA = str_replace_all(LA, "UA", ""))
+
+## clean up la list
+
+dsph <- dsph %>% mutate(LA = str_replace(LA, "Norfolk .+", "Norfolk"),  
+                        LA = str_replace(LA, "Suffolk .+", "Suffolk"), 
+                        row = row_number())
+
+las <- pull(dsph, LA)
+
+## create search list
+
+u <- paste("director public health annual report", las)
+
+u[1:10]
+```
+
+## Try one search and retrieval
+
+```{r try york}
+
+york <- u[152]
+
+safe_google <- safely(googlesearchR)
+
+## pull 5 results
+york_test <-purrr::map(york, ~(safe_google(.x, n= 3)))
+
+york_test1 <- york_test %>% map(., "result") 
+
+york_test2 <- york_test1 %>% flatten() %>% map(., 1) %>%.[1:2]
+
+york_test1
+
+
+```
+
+The results are the same as a direct Google search
+
+![google screen shot](images/google.png)
+
+We can see that the search hasn't given us a link to a downloadable report.
+
+In some cases, the report is further linked to from another page. We can try and read the links on this page.
+
+```{r}
+
+get_links <- function(url){
+  
+  require(purrr)
+  page <- read_html(url) %>%
+    html_nodes("a")  %>%
+    html_attr("href") 
+}
+
+york1 <- unlist(york_test1[[1]][1], as.character)
+
+york1
+
+safe_get_links <- safely(get_links)
+
+york_links <- safe_get_links(york1)$result
+
+york_links
+```
+
+We can see that there are a few links to the DPH report. The 'downloads' one looks promising.
+
+We have written a `get_docs` to identify PDF or docx files on web pages - we can see if there is a downloadable document at `r york_links[14]`. 
+
+```{r}
+
+get_docs <- function(url){
+  
+  page <- read_html(url) %>%
+    html_nodes("a")  %>%
+    html_attr("href") %>%
+    .[grepl("pdf$|docx$", .)]
+  
+}
+
+
+safe_get_docs <- safely(get_docs)
+
+york1 <- unlist(york_test1[[1]][1], as.character)
+
+york1
+
+pdf_test <- map(york_links[14], ~(safe_get_docs(.x)) ) %>% map(., "result")
+
+pdf_test
+
+
+
+```
+
+This reveals a link to the 2016-17 report. The next step is to download the report.
+
+
+
+```{r}
+if(!dir.exists("dph_depot"))dir.create("dir_depot")
+library(downloader)
+
+safe_download <- safely(downloader::download)
+
+pdf_test1 <- unlist(pdf_test)
+
+basename(pdf_test1)
+
+# pdfs <- map(pdf_test, "result") 
+
+pdf_download <- download(pdf_test1, mode = "wb", destfile = basename(pdf_test1))
+
+
+```
+
+This successfully downloads the report. 
+
+We can now read the file with `readtext` and analyse it further.
+
+```{r}
+
+pdf_files <- list.files(pattern = ".pdf")
+
+dph_report <- readtext(pdf_files[1])
+
+dph_report
+
+```
+
+We can rapidly analyse the report
+
+```{r}
+
+dph_report_corpus <- corpus(dph_report)
+
+summary(dph_report_corpus)
+
+```
+
+This shows that the report has 153 sentences and 6765 words.
+
+```{r}
+dict <- dictionary(list(
+  phe = "phe*", 
+  fingertips = "fingertips*", 
+  profile = "profile*", 
+  local_health = "local*health*"))
+
+dtm <- dfm(dph_report_corpus, remove = stopwords("en"), remove_punct = TRUE, ngrams = 1:3)
+
+lookup <- dfm_lookup(dtm, dictionary = dict)
+
+
+lookup %>% data.frame() %>%
+  knitr::kable()
+
+
+```
+
+
+There are 6 mentions of *Fingertips* and 4 of *local health*
+
+```{r}
+
+kwic(dph_report_corpus, phrase("local health"))
+
+
+
+
+```
+
+This shows that one of the references to *local health* is to the PHE tool
+
+
